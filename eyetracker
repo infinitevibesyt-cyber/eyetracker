@@ -1,0 +1,1149 @@
+"""
+Advanced Pupil Tracking Software
+High-accuracy gaze estimation with comprehensive eye tracking features
+
+Requirements:
+    pip install mediapipe opencv-python numpy scikit-learn joblib pyqt6 scipy
+
+Usage:
+    python main_v3_fixed.py
+"""
+
+import sys
+import os
+import time
+import json
+import math
+import threading
+from collections import deque
+from typing import Optional, Tuple, List, Dict, Any
+from dataclasses import dataclass
+
+import cv2
+import numpy as np
+import joblib
+from scipy import interpolate
+from sklearn.preprocessing import PolynomialFeatures, StandardScaler
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import cross_val_score
+from sklearn.metrics import mean_squared_error
+
+from PyQt6 import QtCore, QtGui, QtWidgets
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize
+from PyQt6.QtWidgets import *
+from PyQt6.QtGui import *
+
+import mediapipe as mp
+
+# ==================== Configuration ====================
+@dataclass
+class Config:
+    # Calibration settings
+    CAL_POINTS_GRID = (5, 4)  # 20 points total (5x4 grid)
+    FRAMES_PER_POINT = 30
+    POINT_DISPLAY_TIME = 2.5  # seconds
+    POINT_SETTLE_TIME = 0.8   # seconds to settle before collecting
+
+    # Model settings
+    POLY_DEGREE = 3
+    USE_ADVANCED_FEATURES = True
+    MODEL_TYPE = "ridge"  # "linear", "ridge", "forest"
+
+    # Display settings
+    HIGHLIGHT_RADIUS = 25
+    HIGHLIGHT_COLOR = (255, 100, 100, 180)
+    CALIBRATION_DOT_RADIUS = 8
+    CALIBRATION_DOT_COLOR = (255, 0, 0)
+
+    # Smoothing and filtering
+    SMOOTH_WINDOW = 7
+    VELOCITY_THRESHOLD = 50  # pixels per frame for outlier detection
+    CONFIDENCE_THRESHOLD = 0.7
+
+    # Camera settings
+    CAMERA_WIDTH = 800
+    CAMERA_HEIGHT = 600
+    CAMERA_FPS = 30
+
+    # File paths
+    CALIB_DATA_PATH = "data/advanced_calibration.json"
+    MODEL_PATH = "models/advanced_gaze_model.pkl"
+    CONFIG_PATH = "data/app_config.json"
+
+config = Config()
+
+# Create directories
+os.makedirs("data", exist_ok=True)
+os.makedirs("models", exist_ok=True)
+
+# ==================== Eye Tracking Core ====================
+class EyeTracker:
+    def __init__(self):
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh = None
+        self.mp_drawing = mp.solutions.drawing_utils
+
+        # MediaPipe landmark indices
+        self.LEFT_EYE = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
+        self.RIGHT_EYE = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
+        self.LEFT_IRIS = [468, 469, 470, 471, 472]
+        self.RIGHT_IRIS = [473, 474, 475, 476, 477]
+        self.NOSE_TIP = [1, 2]
+        self.FACE_OUTLINE = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109]
+
+        self.initialize()
+
+    def initialize(self):
+        """Initialize MediaPipe face mesh"""
+        self.face_mesh = self.mp_face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.8,
+            min_tracking_confidence=0.8
+        )
+
+    def extract_features(self, frame: np.ndarray) -> Optional[Dict[str, Any]]:
+        """Extract comprehensive eye tracking features from frame"""
+        if self.face_mesh is None:
+            return None
+
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(rgb_frame)
+
+        if not results.multi_face_landmarks:
+            return None
+
+        landmarks = results.multi_face_landmarks[0]
+        h, w = frame.shape[:2]
+
+        # Convert landmarks to pixel coordinates
+        points = np.array([(lm.x * w, lm.y * h, lm.z) for lm in landmarks.landmark])
+
+        try:
+            features = self._compute_eye_features(points, w, h)
+            features['confidence'] = self._compute_confidence(points)
+            features['frame'] = frame
+            features['landmarks'] = points
+            return features
+        except Exception as e:
+            print(f"Feature extraction error: {e}")
+            return None
+
+    def _compute_eye_features(self, points: np.ndarray, w: int, h: int) -> Dict[str, float]:
+        """Compute comprehensive eye features"""
+        features = {}
+
+        # Basic iris positions
+        left_iris = points[self.LEFT_IRIS[:4]].mean(axis=0)
+        right_iris = points[self.RIGHT_IRIS[:4]].mean(axis=0)
+
+        # Eye corner positions
+        left_eye_corners = points[[33, 133]]  # inner, outer corner
+        right_eye_corners = points[[362, 263]]
+
+        # Eye regions
+        left_eye_region = points[self.LEFT_EYE]
+        right_eye_region = points[self.RIGHT_EYE]
+
+        # Normalize iris positions relative to eye regions
+        left_box = self._get_bounding_box(left_eye_region)
+        right_box = self._get_bounding_box(right_eye_region)
+
+        # Primary features
+        features['left_iris_x'] = (left_iris[0] - left_box[0]) / (left_box[2] - left_box[0] + 1e-6)
+        features['left_iris_y'] = (left_iris[1] - left_box[1]) / (left_box[3] - left_box[1] + 1e-6)
+        features['right_iris_x'] = (right_iris[0] - right_box[0]) / (right_box[2] - right_box[0] + 1e-6)
+        features['right_iris_y'] = (right_iris[1] - right_box[1]) / (right_box[3] - right_box[1] + 1e-6)
+
+        # Advanced features
+        if config.USE_ADVANCED_FEATURES:
+            # Eye aspect ratios
+            features['left_ear'] = self._compute_eye_aspect_ratio(left_eye_region)
+            features['right_ear'] = self._compute_eye_aspect_ratio(right_eye_region)
+
+            # Head pose features
+            nose_tip = points[self.NOSE_TIP[0]]
+            features['head_x'] = nose_tip[0] / w
+            features['head_y'] = nose_tip[1] / h
+            features['head_z'] = nose_tip[2]
+
+            # Inter-eye distance (head scale/distance proxy)
+            eye_distance = np.linalg.norm(left_iris[:2] - right_iris[:2])
+            features['eye_distance'] = eye_distance / (w + 1e-6)
+
+            # Iris-corner distances for finer gaze estimation
+            features['left_iris_inner_dist'] = np.linalg.norm(left_iris[:2] - left_eye_corners[0][:2])
+            features['left_iris_outer_dist'] = np.linalg.norm(left_iris[:2] - left_eye_corners[1][:2])
+            features['right_iris_inner_dist'] = np.linalg.norm(right_iris[:2] - right_eye_corners[0][:2])
+            features['right_iris_outer_dist'] = np.linalg.norm(right_iris[:2] - right_eye_corners[1][:2])
+
+            # Normalize distances
+            left_eye_width = np.linalg.norm(left_eye_corners[0][:2] - left_eye_corners[1][:2])
+            right_eye_width = np.linalg.norm(right_eye_corners[0][:2] - right_eye_corners[1][:2])
+
+            if left_eye_width > 0:
+                features['left_iris_inner_dist'] /= left_eye_width
+                features['left_iris_outer_dist'] /= left_eye_width
+            if right_eye_width > 0:
+                features['right_iris_inner_dist'] /= right_eye_width
+                features['right_iris_outer_dist'] /= right_eye_width
+
+        return features
+
+    def _get_bounding_box(self, points: np.ndarray) -> Tuple[float, float, float, float]:
+        """Get bounding box of points (x_min, y_min, x_max, y_max)"""
+        x_coords = points[:, 0]
+        y_coords = points[:, 1]
+        return (x_coords.min(), y_coords.min(), x_coords.max(), y_coords.max())
+
+    def _compute_eye_aspect_ratio(self, eye_points: np.ndarray) -> float:
+        """Compute eye aspect ratio for blink detection"""
+        # Approximate EAR calculation
+        if len(eye_points) < 6:
+            return 0.0
+
+        # Vertical distances
+        v1 = np.linalg.norm(eye_points[1] - eye_points[5])
+        v2 = np.linalg.norm(eye_points[2] - eye_points[4])
+
+        # Horizontal distance
+        h = np.linalg.norm(eye_points[0] - eye_points[3])
+
+        if h == 0:
+            return 0.0
+
+        return (v1 + v2) / (2.0 * h)
+
+    def _compute_confidence(self, points: np.ndarray) -> float:
+        """Compute confidence score based on landmark quality"""
+        # Simple confidence based on face size and landmark distribution
+        face_points = points[self.FACE_OUTLINE]
+        bbox = self._get_bounding_box(face_points)
+        face_size = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+
+        # Normalize confidence score
+        confidence = min(1.0, face_size / 50000)  # Arbitrary scaling
+        return confidence
+
+# ==================== Camera Capture Thread ====================
+class CameraThread(QThread):
+    frame_ready = pyqtSignal(object)
+    status_update = pyqtSignal(str)
+
+    def __init__(self, camera_id: int = 0):
+        super().__init__()
+        self.camera_id = camera_id
+        self.running = False
+        self.cap = None
+        self.eye_tracker = EyeTracker()
+
+    def run(self):
+        self.cap = cv2.VideoCapture(self.camera_id)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.CAMERA_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAMERA_HEIGHT)
+        self.cap.set(cv2.CAP_PROP_FPS, config.CAMERA_FPS)
+
+        if not self.cap.isOpened():
+            self.status_update.emit("Failed to open camera")
+            return
+
+        self.running = True
+        self.status_update.emit("Camera started successfully")
+
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret:
+                continue
+
+            # Flip frame horizontally for mirror effect
+            frame = cv2.flip(frame, 1)
+
+            # Extract features
+            features = self.eye_tracker.extract_features(frame)
+            self.frame_ready.emit(features)
+
+            self.msleep(33)  # ~30 FPS
+
+    def stop(self):
+        self.running = False
+        if self.cap:
+            self.cap.release()
+        self.wait()
+
+# ==================== Gaze Model ====================
+class GazeModel:
+    def __init__(self):
+        self.model_x = None
+        self.model_y = None
+        self.poly_features = None
+        self.scaler = None
+        self.feature_names = None
+        self.is_trained = False
+
+    def prepare_features(self, feature_dict: Dict[str, float]) -> np.ndarray:
+        """Convert feature dictionary to numpy array"""
+        if self.feature_names is None:
+            # First time - establish feature order
+            self.feature_names = sorted([k for k in feature_dict.keys()
+                                       if k not in ['confidence', 'frame', 'landmarks']])
+
+        return np.array([feature_dict.get(name, 0.0) for name in self.feature_names]).reshape(1, -1)
+
+    def train(self, calibration_data: List[Dict[str, Any]]) -> Dict[str, float]:
+        """Train the gaze estimation model"""
+        if not calibration_data:
+            raise ValueError("No calibration data provided")
+
+        # Prepare training data
+        X_raw = []
+        y_x = []
+        y_y = []
+
+        for sample in calibration_data:
+            target_x, target_y = sample['target']
+            for features in sample['features']:
+                feature_array = self.prepare_features(features)
+                X_raw.append(feature_array.flatten())
+                y_x.append(target_x)
+                y_y.append(target_y)
+
+        X_raw = np.array(X_raw)
+        y_x = np.array(y_x)
+        y_y = np.array(y_y)
+
+        # Feature scaling
+        self.scaler = StandardScaler()
+        X_scaled = self.scaler.fit_transform(X_raw)
+
+        # Polynomial features
+        self.poly_features = PolynomialFeatures(degree=config.POLY_DEGREE, include_bias=True)
+        X_poly = self.poly_features.fit_transform(X_scaled)
+
+        # Train models based on configuration
+        if config.MODEL_TYPE == "ridge":
+            self.model_x = Ridge(alpha=1.0)
+            self.model_y = Ridge(alpha=1.0)
+        elif config.MODEL_TYPE == "forest":
+            self.model_x = RandomForestRegressor(n_estimators=100, random_state=42)
+            self.model_y = RandomForestRegressor(n_estimators=100, random_state=42)
+        else:
+            self.model_x = LinearRegression()
+            self.model_y = LinearRegression()
+
+        self.model_x.fit(X_poly, y_x)
+        self.model_y.fit(X_poly, y_y)
+
+        # Calculate training metrics
+        y_x_pred = self.model_x.predict(X_poly)
+        y_y_pred = self.model_y.predict(X_poly)
+
+        mse_x = mean_squared_error(y_x, y_x_pred)
+        mse_y = mean_squared_error(y_y, y_y_pred)
+        pixel_error = np.sqrt((y_x_pred - y_x)**2 + (y_y_pred - y_y)**2).mean()
+
+        self.is_trained = True
+
+        return {
+            'mse_x': mse_x,
+            'mse_y': mse_y,
+            'mean_pixel_error': pixel_error,
+            'num_samples': len(X_raw)
+        }
+
+    def predict(self, features: Dict[str, float]) -> Optional[Tuple[float, float]]:
+        """Predict gaze location from features"""
+        if not self.is_trained:
+            return None
+
+        try:
+            X = self.prepare_features(features)
+            X_scaled = self.scaler.transform(X)
+            X_poly = self.poly_features.transform(X_scaled)
+
+            pred_x = self.model_x.predict(X_poly)[0]
+            pred_y = self.model_y.predict(X_poly)[0]
+
+            return (pred_x, pred_y)
+        except Exception as e:
+            print(f"Prediction error: {e}")
+            return None
+
+    def save(self, filepath: str):
+        """Save the trained model"""
+        if not self.is_trained:
+            raise ValueError("Model not trained yet")
+
+        model_data = {
+            'model_x': self.model_x,
+            'model_y': self.model_y,
+            'poly_features': self.poly_features,
+            'scaler': self.scaler,
+            'feature_names': self.feature_names,
+            'config': {
+                'poly_degree': config.POLY_DEGREE,
+                'model_type': config.MODEL_TYPE
+            }
+        }
+        joblib.dump(model_data, filepath)
+
+    def load(self, filepath: str) -> bool:
+        """Load a trained model"""
+        try:
+            model_data = joblib.load(filepath)
+            self.model_x = model_data['model_x']
+            self.model_y = model_data['model_y']
+            self.poly_features = model_data['poly_features']
+            self.scaler = model_data['scaler']
+            self.feature_names = model_data['feature_names']
+            self.is_trained = True
+            return True
+        except Exception as e:
+            print(f"Failed to load model: {e}")
+            return False
+# ==================== Custom Widgets ====================
+class ImageDisplayWidget(QLabel):
+    """Custom widget for displaying image with gaze highlight"""
+
+    def __init__(self):
+        super().__init__()
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet("border: 2px solid #444; background-color: #222;")
+        self.setMinimumSize(800, 600)
+
+        self._image = None
+        self._highlight_pos = None
+        self._calibration_points = []
+        self._current_calibration_point = None
+
+    def set_image(self, image_path: Optional[str] = None):
+        """Set the display image"""
+        if image_path and os.path.exists(image_path):
+            pixmap = QPixmap(image_path)
+        else:
+            # Create default gradient background
+            pixmap = self._create_default_background()
+
+        self._image = pixmap
+        self._update_display()
+
+    def _create_default_background(self) -> QPixmap:
+        """Create a default gradient background"""
+        size = QSize(800, 600)
+        pixmap = QPixmap(size)
+
+        painter = QPainter(pixmap)
+        gradient = QLinearGradient(0, 0, size.width(), size.height())
+        gradient.setColorAt(0, QColor(20, 20, 40))
+        gradient.setColorAt(0.5, QColor(40, 40, 80))
+        gradient.setColorAt(1, QColor(20, 20, 40))
+
+        painter.fillRect(pixmap.rect(), gradient)
+        painter.end()
+
+        return pixmap
+
+    def set_highlight(self, x: float, y: float):
+        """Set gaze highlight position (in widget coordinates)"""
+        self._highlight_pos = (x, y)
+        self.update()
+
+    def clear_highlight(self):
+        """Clear gaze highlight"""
+        self._highlight_pos = None
+        self.update()
+
+    def set_calibration_points(self, points: List[Tuple[float, float]]):
+        """Set calibration points to display"""
+        self._calibration_points = points
+        self.update()
+
+    def set_current_calibration_point(self, point: Optional[Tuple[float, float]]):
+        """Set the currently active calibration point"""
+        self._current_calibration_point = point
+        self.update()
+
+    def clear_calibration(self):
+        """Clear all calibration display elements"""
+        self._calibration_points = []
+        self._current_calibration_point = None
+        self.update()
+
+    def _update_display(self):
+        """Update the displayed image"""
+        if self._image:
+            scaled = self._image.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio,
+                                      Qt.TransformationMode.SmoothTransformation)
+            self.setPixmap(scaled)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+
+        if not self._image:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Get the actual image area
+        pixmap = self.pixmap()
+        if not pixmap:
+            return
+
+        # Calculate image position in widget
+        img_rect = pixmap.rect()
+        widget_rect = self.rect()
+
+        x_offset = (widget_rect.width() - img_rect.width()) // 2
+        y_offset = (widget_rect.height() - img_rect.height()) // 2
+
+        # Draw calibration points
+        for point in self._calibration_points:
+            px = x_offset + point[0] * img_rect.width()
+            py = y_offset + point[1] * img_rect.height()
+
+            painter.setPen(QPen(QColor(100, 100, 100), 2))
+            painter.setBrush(QBrush(QColor(100, 100, 100, 100)))
+            painter.drawEllipse(QPointF(px, py), 4, 4)
+
+        # Draw current calibration point
+        if self._current_calibration_point:
+            px = x_offset + self._current_calibration_point[0] * img_rect.width()
+            py = y_offset + self._current_calibration_point[1] * img_rect.height()
+
+            color = QColor(*config.CALIBRATION_DOT_COLOR)
+            painter.setPen(QPen(color, 3))
+            painter.setBrush(QBrush(color))
+            painter.drawEllipse(QPointF(px, py), config.CALIBRATION_DOT_RADIUS,
+                              config.CALIBRATION_DOT_RADIUS)
+
+            # Pulsing effect
+            painter.setPen(QPen(color, 1))
+            painter.setBrush(QBrush(QColor(color.red(), color.green(), color.blue(), 50)))
+            painter.drawEllipse(QPointF(px, py), config.CALIBRATION_DOT_RADIUS + 5,
+                              config.CALIBRATION_DOT_RADIUS + 5)
+
+        # Draw gaze highlight
+        if self._highlight_pos:
+            hx = x_offset + self._highlight_pos[0]
+            hy = y_offset + self._highlight_pos[1]
+
+            color = QColor(*config.HIGHLIGHT_COLOR)
+            painter.setPen(QPen(color, 2))
+            painter.setBrush(QBrush(QColor(color.red(), color.green(), color.blue(),
+                                         config.HIGHLIGHT_COLOR[3])))
+            painter.drawEllipse(QPointF(hx, hy), config.HIGHLIGHT_RADIUS, config.HIGHLIGHT_RADIUS)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_display()
+
+
+class WebcamPreview(QLabel):
+    """Webcam preview widget"""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(320, 240)
+        self.setStyleSheet("border: 1px solid #666; background-color: #111;")
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setText("Camera Preview")
+
+    def update_frame(self, features: Optional[Dict[str, Any]]):
+        """Update preview with current camera frame"""
+        if not features or 'frame' not in features:
+            return
+
+        frame = features['frame']
+
+        # Draw eye tracking overlay
+        if 'landmarks' in features:
+            frame = self._draw_eye_overlay(frame, features)
+
+        # Convert to Qt format
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Resize to fit widget
+        small_frame = cv2.resize(rgb_frame, (320, 240))
+        h, w, ch = small_frame.shape
+        bytes_per_line = ch * w
+
+        qt_image = QImage(small_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        self.setPixmap(QPixmap.fromImage(qt_image))
+
+    def _draw_eye_overlay(self, frame: np.ndarray, features: Dict[str, Any]) -> np.ndarray:
+        """Draw eye tracking overlay on frame"""
+        if 'landmarks' not in features:
+            return frame
+
+        points = features['landmarks'].astype(int)
+
+        # Draw eye regions
+        eye_tracker = EyeTracker()
+
+        # Left eye
+        if len(points) > max(eye_tracker.LEFT_EYE):
+            left_eye_pts = points[eye_tracker.LEFT_EYE][:, :2]
+            cv2.polylines(frame, [left_eye_pts], True, (0, 255, 0), 1)
+
+        # Right eye
+        if len(points) > max(eye_tracker.RIGHT_EYE):
+            right_eye_pts = points[eye_tracker.RIGHT_EYE][:, :2]
+            cv2.polylines(frame, [right_eye_pts], True, (0, 255, 0), 1)
+
+        # Iris centers
+        if len(points) > max(eye_tracker.LEFT_IRIS):
+            left_iris = points[eye_tracker.LEFT_IRIS[:4]][:, :2].mean(axis=0).astype(int)
+            cv2.circle(frame, tuple(left_iris), 3, (255, 0, 0), -1)
+
+        if len(points) > max(eye_tracker.RIGHT_IRIS):
+            right_iris = points[eye_tracker.RIGHT_IRIS[:4]][:, :2].mean(axis=0).astype(int)
+            cv2.circle(frame, tuple(right_iris), 3, (255, 0, 0), -1)
+
+        return frame
+
+# ==================== Main Application ====================
+class MainApplication(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Advanced Pupil Tracking Software v2.0")
+        self.setGeometry(100, 100, 1200, 800)
+
+        # Initialize components
+        self.camera_thread = None
+        self.gaze_model = GazeModel()
+        self.calibration_data = []
+        self.recent_predictions = deque(maxlen=config.SMOOTH_WINDOW)
+
+        # State variables
+        self.is_calibrating = False
+        self.is_highlighting = False
+        self.current_features = None
+        self.calibration_timer = QTimer()
+        self.prediction_timer = QTimer()
+
+        # Setup UI
+        self.setup_ui()
+        self.setup_connections()
+
+        # Load saved configuration
+        self.load_config()
+
+        # Start camera
+        self.start_camera()
+
+    def setup_ui(self):
+        """Setup the user interface"""
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+
+        # Main layout
+        main_layout = QHBoxLayout(central_widget)
+
+        # Left panel - Controls
+        # FIXED: use QWidget to contain the layout so we can call widget sizing methods
+        left_panel_widget = QWidget()
+        left_panel_widget.setMaximumWidth(300)
+        left_layout = QVBoxLayout(left_panel_widget)
+        # Control buttons
+        controls_group = QGroupBox("Controls")
+        controls_layout = QVBoxLayout(controls_group)
+
+        self.btn_load_image = QPushButton("Load Image")
+        self.btn_use_default = QPushButton("Use Default Background")
+        self.btn_calibrate = QPushButton("Start Calibration")
+        self.btn_train = QPushButton("Train Model")
+        self.btn_highlight = QPushButton("Start Highlighting")
+
+        self.btn_train.setEnabled(False)
+        self.btn_highlight.setEnabled(False)
+
+        controls_layout.addWidget(self.btn_load_image)
+        controls_layout.addWidget(self.btn_use_default)
+        controls_layout.addWidget(QLabel())  # Spacer
+        controls_layout.addWidget(self.btn_calibrate)
+        controls_layout.addWidget(self.btn_train)
+        controls_layout.addWidget(self.btn_highlight)
+
+        # Settings group
+        settings_group = QGroupBox("Settings")
+        settings_layout = QVBoxLayout(settings_group)
+
+        self.chk_show_preview = QCheckBox("Show Camera Preview")
+        self.chk_show_preview.setChecked(True)
+
+        self.slider_smoothing = QSlider(Qt.Orientation.Horizontal)
+        self.slider_smoothing.setRange(3, 15)
+        self.slider_smoothing.setValue(config.SMOOTH_WINDOW)
+
+        settings_layout.addWidget(self.chk_show_preview)
+        settings_layout.addWidget(QLabel("Smoothing:"))
+        settings_layout.addWidget(self.slider_smoothing)
+
+        # Status group
+        status_group = QGroupBox("Status")
+        status_layout = QVBoxLayout(status_group)
+
+        self.lbl_camera_status = QLabel("Camera: Not started")
+        self.lbl_calibration_status = QLabel("Calibration: Not done")
+        self.lbl_model_status = QLabel("Model: Not trained")
+        self.lbl_accuracy = QLabel("Accuracy: N/A")
+
+        status_layout.addWidget(self.lbl_camera_status)
+        status_layout.addWidget(self.lbl_calibration_status)
+        status_layout.addWidget(self.lbl_model_status)
+        status_layout.addWidget(self.lbl_accuracy)
+
+        # Webcam preview
+        preview_group = QGroupBox("Camera Preview")
+        preview_layout = QVBoxLayout(preview_group)
+
+        self.webcam_preview = WebcamPreview()
+        preview_layout.addWidget(self.webcam_preview)
+
+        # Add all groups to left layout (widget)
+        left_layout.addWidget(controls_group)
+        left_layout.addWidget(settings_group)
+        left_layout.addWidget(status_group)
+        left_layout.addWidget(preview_group)
+        left_layout.addStretch()
+
+        # Right panel - Image display (also a widget container to be symmetric/flexible)
+        right_panel_widget = QWidget()
+        right_layout = QVBoxLayout(right_panel_widget)
+
+        # Progress bar for calibration
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+
+        # Main image display
+        self.image_display = ImageDisplayWidget()
+
+        # Info label
+        self.info_label = QLabel("Load an image or use default background to begin")
+        self.info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.info_label.setStyleSheet("color: #888; font-size: 14px; padding: 10px;")
+
+        right_layout.addWidget(self.progress_bar)
+        right_layout.addWidget(self.image_display)
+        right_layout.addWidget(self.info_label)
+
+        # Add panels to main layout (widgets, not raw layouts)
+        main_layout.addWidget(left_panel_widget)
+        main_layout.addWidget(right_panel_widget, stretch=1)
+
+        # Set default background
+        self.image_display.set_image()
+
+    def setup_connections(self):
+        """Setup signal connections"""
+        self.btn_load_image.clicked.connect(self.load_image)
+        self.btn_use_default.clicked.connect(self.use_default_background)
+        self.btn_calibrate.clicked.connect(self.start_calibration)
+        self.btn_train.clicked.connect(self.train_model)
+        self.btn_highlight.clicked.connect(self.toggle_highlighting)
+
+        self.chk_show_preview.stateChanged.connect(self.toggle_preview)
+        self.slider_smoothing.valueChanged.connect(self.update_smoothing)
+
+        self.calibration_timer.timeout.connect(self.calibration_step)
+        self.prediction_timer.timeout.connect(self.update_prediction)
+
+    def load_config(self):
+        """Load saved configuration"""
+        if os.path.exists(config.CONFIG_PATH):
+            try:
+                with open(config.CONFIG_PATH, 'r') as f:
+                    saved_config = json.load(f)
+
+                # Update slider value
+                if 'smooth_window' in saved_config:
+                    self.slider_smoothing.setValue(saved_config['smooth_window'])
+
+            except Exception as e:
+                print(f"Failed to load config: {e}")
+
+    def save_config(self):
+        """Save current configuration"""
+        config_data = {
+            'smooth_window': self.slider_smoothing.value(),
+            'show_preview': self.chk_show_preview.isChecked()
+        }
+
+        try:
+            with open(config.CONFIG_PATH, 'w') as f:
+                json.dump(config_data, f)
+        except Exception as e:
+            print(f"Failed to save config: {e}")
+
+    def start_camera(self):
+        """Start the camera thread"""
+        # Stop existing thread if running
+        if self.camera_thread:
+            try:
+                self.camera_thread.stop()
+            except Exception:
+                pass
+
+        self.camera_thread = CameraThread()
+        self.camera_thread.frame_ready.connect(self.on_frame_ready)
+        self.camera_thread.status_update.connect(self.on_camera_status)
+        self.camera_thread.start()
+
+    def on_frame_ready(self, features):
+        """Handle new frame from camera"""
+        self.current_features = features
+
+        if self.chk_show_preview.isChecked():
+            # Protect against None frames
+            try:
+                self.webcam_preview.update_frame(features)
+            except Exception:
+                pass
+
+    def on_camera_status(self, status):
+        """Handle camera status updates"""
+        self.lbl_camera_status.setText(f"Camera: {status}")
+    def load_image(self):
+        """Load an image file"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Image", "",
+            "Image Files (*.png *.jpg *.jpeg *.bmp *.gif *.tiff)"
+        )
+
+        if file_path:
+            self.image_display.set_image(file_path)
+            self.info_label.setText(f"Loaded: {os.path.basename(file_path)}")
+
+    def use_default_background(self):
+        """Use default gradient background"""
+        self.image_display.set_image()
+        self.info_label.setText("Using default gradient background")
+
+    def start_calibration(self):
+        """Start the calibration process"""
+        if not self.current_features:
+            QMessageBox.warning(self, "No Camera Input",
+                                "Please ensure camera is working and face is detected")
+            return
+
+        # Generate calibration points in a grid
+        self.calibration_points = self.generate_calibration_points()
+        self.calibration_data = []
+        self.calibration_index = 0
+        self.calibration_frames = []
+        self.calibration_start_time = 0
+        self.is_calibrating = True
+
+        # Update UI
+        self.btn_calibrate.setText("Calibrating...")
+        self.btn_calibrate.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setMaximum(len(self.calibration_points))
+        self.progress_bar.setValue(0)
+
+        # Show all calibration points
+        self.image_display.set_calibration_points(self.calibration_points)
+
+        # Start calibration timer
+        self.calibration_timer.start(50)  # 20 FPS
+        self.calibration_start_time = time.time()
+
+        self.info_label.setText("Calibration started - look at the red dots")
+
+    def generate_calibration_points(self) -> List[Tuple[float, float]]:
+        """Generate grid of calibration points"""
+        points = []
+        rows, cols = config.CAL_POINTS_GRID
+
+        # Add margin around edges
+        margin_x = 0.1
+        margin_y = 0.1
+
+        for row in range(rows):
+            for col in range(cols):
+                x = margin_x + (1 - 2 * margin_x) * col / (cols - 1)
+                y = margin_y + (1 - 2 * margin_y) * row / (rows - 1)
+                points.append((x, y))
+
+        return points
+
+    def calibration_step(self):
+        """Handle one step of calibration process"""
+        if not self.is_calibrating or self.calibration_index >= len(self.calibration_points):
+            self.finish_calibration()
+            return
+
+        current_point = self.calibration_points[self.calibration_index]
+        elapsed = time.time() - self.calibration_start_time
+
+        if elapsed < config.POINT_SETTLE_TIME:
+            # Still settling - show current point
+            self.image_display.set_current_calibration_point(current_point)
+            return
+
+        # Collecting phase
+        self.image_display.set_current_calibration_point(current_point)
+
+        if self.current_features and self.current_features.get('confidence', 0) > config.CONFIDENCE_THRESHOLD:
+            # Filter out non-essential keys for storage
+            features_to_store = {k: v for k, v in self.current_features.items()
+                                 if k not in ['frame', 'landmarks', 'confidence']}
+            self.calibration_frames.append(features_to_store)
+
+        # Check if we have enough frames for this point
+        total_time = elapsed - config.POINT_SETTLE_TIME
+        if (len(self.calibration_frames) >= config.FRAMES_PER_POINT or
+                total_time >= config.POINT_DISPLAY_TIME):
+
+            if len(self.calibration_frames) >= 5:  # Minimum frames required
+                # Calculate target position in image coordinates
+                img_rect = self.image_display._image.rect() if self.image_display._image else QRect(0, 0, 800, 600)
+                target_x = current_point[0] * img_rect.width()
+                target_y = current_point[1] * img_rect.height()
+
+                # Store calibration data
+                self.calibration_data.append({
+                    'target': (target_x, target_y),
+                    'features': self.calibration_frames.copy()
+                })
+
+                self.info_label.setText(f"Point {self.calibration_index + 1}/{len(self.calibration_points)} completed "
+                                        f"({len(self.calibration_frames)} frames)")
+            else:
+                self.info_label.setText(f"Point {self.calibration_index + 1} failed - not enough valid frames")
+
+            # Move to next point
+            self.calibration_index += 1
+            self.calibration_frames = []
+            self.calibration_start_time = time.time()
+            self.progress_bar.setValue(self.calibration_index)
+
+    def finish_calibration(self):
+        """Finish the calibration process"""
+        self.is_calibrating = False
+        self.calibration_timer.stop()
+
+        # Update UI
+        self.btn_calibrate.setText("Start Calibration")
+        self.btn_calibrate.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.image_display.clear_calibration()
+
+        # Save calibration data
+        if len(self.calibration_data) >= 10:  # Minimum points for training
+            self.save_calibration_data()
+            self.lbl_calibration_status.setText(f"Calibration: {len(self.calibration_data)} points collected")
+            self.btn_train.setEnabled(True)
+            self.info_label.setText(f"Calibration completed with {len(self.calibration_data)} points")
+        else:
+            self.lbl_calibration_status.setText("Calibration: Failed - insufficient data")
+            self.info_label.setText("Calibration failed - please try again")
+            QMessageBox.warning(self, "Calibration Failed",
+                                "Insufficient calibration data collected. Please try again.")
+
+    def save_calibration_data(self):
+        """Save calibration data to file"""
+        try:
+            with open(config.CALIB_DATA_PATH, 'w') as f:
+                json.dump(self.calibration_data, f, indent=2)
+        except Exception as e:
+            print(f"Failed to save calibration data: {e}")
+
+    def train_model(self):
+        """Train the gaze estimation model"""
+        if not self.calibration_data:
+            # Try to load from file
+            if os.path.exists(config.CALIB_DATA_PATH):
+                try:
+                    with open(config.CALIB_DATA_PATH, 'r') as f:
+                        self.calibration_data = json.load(f)
+                except Exception as e:
+                    QMessageBox.warning(self, "Training Failed", f"Failed to load calibration data: {e}")
+                    return
+            else:
+                QMessageBox.warning(self, "No Calibration Data", "Please run calibration first")
+                return
+
+        try:
+            # Train the model
+            self.info_label.setText("Training model...")
+            QApplication.processEvents()
+
+            metrics = self.gaze_model.train(self.calibration_data)
+
+            # Save the model
+            self.gaze_model.save(config.MODEL_PATH)
+
+            # Update UI
+            self.lbl_model_status.setText(f"Model: Trained ({config.MODEL_TYPE})")
+            self.lbl_accuracy.setText(f"Accuracy: {metrics['mean_pixel_error']:.1f}px error")
+            self.btn_highlight.setEnabled(True)
+
+            self.info_label.setText(f"Model trained successfully! "
+                                    f"Mean error: {metrics['mean_pixel_error']:.1f} pixels "
+                                    f"({metrics['num_samples']} training samples)")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Training Failed", f"Model training failed: {str(e)}")
+            print(f"Training error: {e}")
+
+    def toggle_highlighting(self):
+        """Toggle gaze highlighting on/off"""
+        if not self.is_highlighting:
+            # Try to load model if not already loaded
+            if not self.gaze_model.is_trained:
+                if os.path.exists(config.MODEL_PATH):
+                    if not self.gaze_model.load(config.MODEL_PATH):
+                        QMessageBox.warning(self, "Model Loading Failed",
+                                            "Could not load trained model")
+                        return
+                else:
+                    QMessageBox.warning(self, "No Model", "Please train a model first")
+                    return
+
+            # Start highlighting
+            self.is_highlighting = True
+            self.btn_highlight.setText("Stop Highlighting")
+            self.prediction_timer.start(25)  # ~40 FPS
+            self.info_label.setText("Gaze highlighting active")
+
+        else:
+            # Stop highlighting
+            self.is_highlighting = False
+            self.btn_highlight.setText("Start Highlighting")
+            self.prediction_timer.stop()
+            self.image_display.clear_highlight()
+            self.info_label.setText("Gaze highlighting stopped")
+
+    def update_prediction(self):
+        """Update gaze prediction and highlight"""
+        if not self.is_highlighting or not self.current_features:
+            return
+
+        # Check confidence threshold
+        confidence = self.current_features.get('confidence', 0)
+        if confidence < config.CONFIDENCE_THRESHOLD:
+            self.image_display.clear_highlight()
+            return
+
+        # Get prediction
+        prediction = self.gaze_model.predict(self.current_features)
+        if prediction is None:
+            return
+
+        pred_x, pred_y = prediction
+
+        # Add to recent predictions for smoothing
+        self.recent_predictions.append((pred_x, pred_y))
+
+        # Apply smoothing
+        if len(self.recent_predictions) > 1:
+            # Remove outliers using velocity threshold
+            filtered_preds = self.filter_outliers(list(self.recent_predictions))
+            if filtered_preds:
+                # Average recent predictions
+                avg_x = np.mean([p[0] for p in filtered_preds])
+                avg_y = np.mean([p[1] for p in filtered_preds])
+            else:
+                avg_x, avg_y = pred_x, pred_y
+        else:
+            avg_x, avg_y = pred_x, pred_y
+
+        # Convert to display coordinates
+        if self.image_display._image:
+            img_rect = self.image_display._image.rect()
+            # Normalize to 0-1 range within image
+            norm_x = avg_x / (img_rect.width() + 1e-6)
+            norm_y = avg_y / (img_rect.height() + 1e-6)
+
+            # Clamp to image bounds
+            norm_x = max(0, min(1, norm_x))
+            norm_y = max(0, min(1, norm_y))
+
+            # Convert to display coordinates
+            display_x = norm_x * img_rect.width()
+            display_y = norm_y * img_rect.height()
+
+            self.image_display.set_highlight(display_x, display_y)
+
+    def filter_outliers(self, predictions: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        """Remove outlier predictions based on velocity threshold"""
+        if len(predictions) < 2:
+            return predictions
+
+        filtered = [predictions[0]]
+
+        for i in range(1, len(predictions)):
+            prev_x, prev_y = predictions[i - 1]
+            curr_x, curr_y = predictions[i]
+
+            # Calculate velocity (distance between consecutive predictions)
+            velocity = math.sqrt((curr_x - prev_x) ** 2 + (curr_y - prev_y) ** 2)
+
+            if velocity <= config.VELOCITY_THRESHOLD:
+                filtered.append(predictions[i])
+
+        return filtered if len(filtered) > 0 else [predictions[-1]]
+
+    def toggle_preview(self, state):
+        """Toggle camera preview on/off"""
+        if state != Qt.CheckState.Checked:
+            self.webcam_preview.clear()
+
+    def update_smoothing(self, value):
+        """Update smoothing window size"""
+        self.recent_predictions = deque(maxlen=value)
+        config.SMOOTH_WINDOW = value
+
+    def closeEvent(self, event):
+        """Handle application close"""
+        self.save_config()
+
+        if self.camera_thread:
+            try:
+                self.camera_thread.stop()
+            except Exception:
+                pass
+
+        self.calibration_timer.stop()
+        self.prediction_timer.stop()
+
+        event.accept()
+
+# ==================== Application Entry Point ====================
+def main():
+    """Main application entry point"""
+    app = QApplication(sys.argv)
+    app.setStyle('Fusion')
+
+    # Set dark theme
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor(255, 255, 255))
+    palette.setColor(QPalette.ColorRole.Base, QColor(25, 25, 25))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor(53, 53, 53))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(0, 0, 0))
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor(255, 255, 255))
+    palette.setColor(QPalette.ColorRole.Text, QColor(255, 255, 255))
+    palette.setColor(QPalette.ColorRole.Button, QColor(53, 53, 53))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor(255, 255, 255))
+    palette.setColor(QPalette.ColorRole.BrightText, QColor(255, 0, 0))
+    palette.setColor(QPalette.ColorRole.Link, QColor(42, 130, 218))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor(0, 0, 0))
+    app.setPalette(palette)
+
+    # Create and show main window
+    window = MainApplication()
+    window.show()
+
+    # Handle application exit
+    try:
+        sys.exit(app.exec())
+    except SystemExit:
+        pass
+
+
+if __name__ == "__main__":
+    main()
+
